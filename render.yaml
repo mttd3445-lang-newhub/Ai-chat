@@ -17,7 +17,7 @@ services:
       - key: AUTO_RESPOND_CHANNEL_IDS
         sync: false
       - key: DEFAULT_PERSONA
-        value: friendly
+        value: code
       - key: ZAI_MODEL
         value: glm-4-flash  # ฟรีโควต้า!
       - key: LOG_LEVEL
