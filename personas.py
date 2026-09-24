@@ -145,7 +145,7 @@ PERSONAS = {
 
 
 def get_persona(name: str) -> dict:
-    """ดึง persona ตามชื่อ — ถ้าไม่มี คืน default (friendly)"""
+    """ดึง persona ตามชื่อ — ถ้าไม่มี คืน default (code)"""
     return PERSONAS.get(name, PERSONAS["gang"])
 
 
