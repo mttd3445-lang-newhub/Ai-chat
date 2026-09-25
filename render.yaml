@@ -15,7 +15,7 @@ services:
       - key: ZAI_API_KEY
         sync: false
       - key: AUTO_RESPOND_CHANNEL_IDS
-        sync: 1552499103244754955
+        sync: false
       - key: DEFAULT_PERSONA
         value: coder
       - key: ZAI_MODEL
