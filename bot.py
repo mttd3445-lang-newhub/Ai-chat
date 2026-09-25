@@ -1,18 +1,9 @@
 """
 bot.py — บอท Discord + Z.ai GLM เวอร์ชัน production-ready
-
-ฟีเจอร์:
-  • AI chat พร้อม memory ต่อ channel/user
-  • @mention, DM, และห้อง auto-respond
-  • Slash commands + prefix commands
-  • อ่านไฟล์แนบ (.py, .js, .txt, .md, .json, ฯลฯ) วิเคราะห์/อธิบาย/แก้ไข
-  • หลายบุคลิก (persona) สลับได้ด้วย /setpersona
-  • Image generation ผ่าน /image <prompt>
-  • HTTP health check endpoint + stats
-  • Logging ลงไฟล์แบบ rotation
-  • รองรับ Docker + systemd deployment
+พร้อมเครื่องมือเขียนโค้ด: /snippet /complete /test /review
 """
 import asyncio
+import re
 import sys
 import time
 
@@ -71,14 +62,12 @@ async def _call_ai(messages):
 
 
 async def _safe_send(channel, text: str):
-    """ส่งข้อความ แบ่ง chunk ถ้าเกิน 2000 ตัวอักษร"""
     if not text:
         return
     chunk_size = 1900
     if len(text) <= chunk_size:
         await channel.send(text)
         return
-
     chunks, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > chunk_size:
@@ -89,14 +78,12 @@ async def _safe_send(channel, text: str):
             current = (current + "\n" + line) if current else line
     if current:
         chunks.append(current)
-
     final = []
     for c in chunks:
         while len(c) > chunk_size:
             final.append(c[:chunk_size])
             c = c[chunk_size:]
         final.append(c)
-
     for c in final:
         await channel.send(c)
         await asyncio.sleep(0.2)
@@ -107,7 +94,51 @@ def _bump_stat(key: str, n: int = 1):
         HealthHandler.bot_status[key] = HealthHandler.bot_status.get(key, 0) + n
 
 
-# ---------- event handlers ----------
+# ---------- ระบบสร้างรูปอัตโนมัติ ----------
+IMAGE_REQUEST_PATTERNS = [
+    r'^วาดรูป\s*(.+)',
+    r'^วาดภาพ\s*(.+)',
+    r'^วาด\s+(.+?)(?:\s+ให้หน่อย|\s+หน่อย|\s+ให้|\s*$)',
+    r'^สร้างรูป\s*(.+)',
+    r'^สร้างภาพ\s*(.+)',
+    r'^ทำรูป\s*(.+)',
+    r'^รูป\s+(.+?)(?:\s+ให้หน่อย|\s*$)',
+    r'^generate\s+(?:an?\s+)?(?:image|picture)\s+(?:of\s+)?(.+)',
+    r'^draw\s+(?:an?\s+)?(?:image|picture)?\s*(?:of\s+)?(.+)',
+    r'^make\s+(?:an?\s+)?(?:image|picture)\s+(?:of\s+)?(.+)',
+]
+
+
+def _detect_image_request(text: str):
+    text = text.strip()
+    for pattern in IMAGE_REQUEST_PATTERNS:
+        m = re.match(pattern, text, re.IGNORECASE)
+        if m:
+            prompt = m.group(1).strip().rstrip('?.!')
+            if len(prompt) >= 2:
+                return prompt
+    return None
+
+
+async def _generate_image_response(channel, prompt: str):
+    async with channel.typing():
+        try:
+            loop = asyncio.get_event_loop()
+            url = await loop.run_in_executor(
+                None, lambda: ai.generate_image(prompt)
+            )
+            if url:
+                await _safe_send(channel, f"🎨 รูป: `{prompt}`\n{url}")
+                _bump_stat("ai_calls")
+            else:
+                await _safe_send(channel, "❌ สร้างรูปไม่สำเร็จ")
+                _bump_stat("ai_errors")
+        except AIClientError as e:
+            _bump_stat("ai_errors")
+            await _safe_send(channel, f"❌ สร้างรูปไม่ได้: `{e}`")
+
+
+# ---------- events ----------
 @bot.event
 async def on_ready():
     log.info("✅ ล็อกอินแล้วในชื่อ %s (id=%s)", bot.user, bot.user.id)
@@ -119,18 +150,13 @@ async def on_ready():
         except Exception as e:
             log.warning("sync slash commands ไม่ได้: %s", e)
 
-    log.info("📢 Auto-respond channels: %s",
-             AUTO_RESPOND_CHANNEL_IDS or "(ไม่ได้ตั้ง)")
-    log.info("🎭 Default persona: %s",
-             get_persona(memory.get_persona_name("__default__"))["name"])
+    log.info("📢 Auto-respond channels: %s", AUTO_RESPOND_CHANNEL_IDS or "(ไม่ได้ตั้ง)")
 
     if HEALTH_CHECK_ENABLED:
         start_health_server()
 
-    update_status(
-        guilds=len(bot.guilds),
-        users=sum(g.member_count or 0 for g in bot.guilds),
-    )
+    update_status(guilds=len(bot.guilds),
+                  users=sum(g.member_count or 0 for g in bot.guilds))
 
     try:
         await bot.change_presence(
@@ -159,11 +185,8 @@ async def on_message(message: discord.Message):
     )
     is_auto = not is_dm and message.channel.id in AUTO_RESPOND_CHANNEL_IDS
 
-    has_attachments = bool(message.attachments)
-
     if not (is_dm or is_mentioned or is_auto):
-        if not (is_mentioned and has_attachments):
-            return
+        return
 
     file_contents, skipped = await read_attachments(message)
 
@@ -175,10 +198,8 @@ async def on_message(message: discord.Message):
     if content and file_contents:
         full_prompt = content + "\n\n" + format_files_for_prompt(file_contents)
     elif file_contents:
-        full_prompt = (
-            "วิเคราะห์/อธิบาย/แก้ไขไฟล์ต่อไปนี้ตามที่เหมาะสม:\n\n"
-            + format_files_for_prompt(file_contents)
-        )
+        full_prompt = ("วิเคราะห์/อธิบาย/แก้ไขไฟล์ต่อไปนี้ตามที่เหมาะสม:\n\n"
+                        + format_files_for_prompt(file_contents))
     else:
         full_prompt = content
 
@@ -186,6 +207,12 @@ async def on_message(message: discord.Message):
         full_prompt += "\n\n⚠️ ไฟล์ที่ข้าม: " + ", ".join(skipped)
 
     if not full_prompt:
+        return
+
+    # เช็คก่อนว่าเป็นคำขอสร้างรูปไหม
+    image_prompt = _detect_image_request(content)
+    if image_prompt:
+        await _generate_image_response(message.channel, image_prompt)
         return
 
     if STATS_ENABLED:
@@ -248,10 +275,10 @@ async def persona_prefix(ctx: commands.Context, name: str = ""):
         p = get_persona(name.lower())
         await ctx.send(f"🎭 บุคลิกถูกเปลี่ยนเป็น **{p['name']}**\n> {p['description']}")
     else:
-        await ctx.send(f"❌ ไม่มี persona ชื่อ '{name}' — ลองดูรายการ: `{COMMAND_PREFIX}persona`")
+        await ctx.send(f"❌ ไม่มี persona ชื่อ '{name}'")
 
 
-# ---------- slash commands ----------
+# ---------- slash commands พื้นฐาน ----------
 @bot.tree.command(name="ping", description="ตรวจสอบว่าบอทยังทำงานอยู่")
 async def ping_slash(interaction: discord.Interaction):
     await interaction.response.send_message(MSG_PONG)
@@ -322,6 +349,234 @@ async def stats_slash(interaction: discord.Interaction):
     await interaction.response.send_message(text)
 
 
+# ---------- 🆕 เครื่องมือเขียนโค้ดใหม่ ----------
+@bot.tree.command(name="snippet", description="สร้างโค้ดสั้น ๆ สำหรับ task เฉพาะ")
+@app_commands.describe(
+    language="ภาษาโปรแกรม (python/javascript/typescript/sql/go/rust)",
+    task="อะไรที่อยากให้โค้ดทำ (เช่น 'หาจำนวนเฉพาะ')"
+)
+async def snippet_slash(interaction: discord.Interaction, language: str, task: str):
+    """สร้างโค้ดสั้น ๆ สำหรับ task เฉพาะ — ใช้ persona coder"""
+    await interaction.response.defer(thinking=True)
+
+    snippet_prompt = (
+        f"เขียน {language} สำหรับ: {task}\n\n"
+        "ข้อกำหนด:\n"
+        "- เขียนโค้ดสมบูรณ์ รันได้จริง ไม่มี '...'\n"
+        "- มี type hints / type annotations\n"
+        "- มี comment อธิบายเป็นไทย\n"
+        "- มี error handling\n"
+        "- มี example usage ท้ายโค้ด\n"
+        "- ใส่ unit test อย่างน้อย 2 test cases\n"
+        "- อธิบายสั้น ๆ ก่อนโค้ด และ edge cases หลังโค้ด"
+    )
+
+    messages = [
+        {"role": "system", "content": get_persona("coder")["system_prompt"]},
+        {"role": "user", "content": snippet_prompt},
+    ]
+
+    try:
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(None, lambda: ai.chat(messages))
+        _bump_stat("ai_calls")
+        await _safe_send(interaction.channel, f"🛠️ **Snippet: {language}** — {task}\n\n{reply}")
+        await interaction.followup.send("✅ สร้างโค้ดให้แล้ว — ดูด้านบน")
+    except AIClientError as e:
+        _bump_stat("ai_errors")
+        await interaction.followup.send(f"❌ สร้างไม่สำเร็จ: {e}")
+
+
+@bot.tree.command(name="complete", description="เติมโค้ดที่ขาดในไฟล์แนบให้สมบูรณ์")
+@app_commands.describe(
+    language="ภาษาของไฟล์ (python/javascript/typescript/sql)"
+)
+async def complete_slash(interaction: discord.Interaction, language: str):
+    """อ่านไฟล์แนบ และเติมโค้ดที่ขาด (เช่น '...' หรือ TODO)"""
+    # อ่านไฟล์แนบจาก message ล่าสุดของ channel
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.DMChannel)):
+        await interaction.response.send_message("❌ ใช้ใน text channel เท่านั้น")
+        return
+
+    # ดึงข้อความล่าสุด 10 ข้อความ
+    history = [m async for m in channel.history(limit=10, oldest_first=False)]
+    history.reverse()
+
+    # หาข้อความที่มีไฟล์แนบ
+    file_contents, _ = await read_attachments_from_history(history, language)
+    if not file_contents:
+        await interaction.response.send_message(
+            "❌ ไม่เจอไฟล์แนบใน 10 ข้อความล่าสุด — กรุณาแนบไฟล์ก่อน"
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    prompt = (
+        f"เติมโค้ดที่ขาดในไฟล์ต่อไปนี้ (ภาษา {language}) ให้สมบูรณ์รันได้จริง:\n\n"
+        + format_files_for_prompt(file_contents)
+        + "\n\nเงื่อนไข:\n"
+        "- แทนที่ '...', 'TODO', 'pass', '// your code here' ด้วยโค้ดจริง\n"
+        "- อธิบายสั้น ๆ ว่าเติมอะไรไปบ้าง\n"
+        "- ถ้าโค้ดเดิมผิด ให้แก้ด้วย พร้อมอธิบาย\n"
+        "- ส่งคืนเป็นไฟล์เต็ม ไม่ตัด"
+    )
+
+    messages = [
+        {"role": "system", "content": get_persona("coder")["system_prompt"]},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(None, lambda: ai.chat(messages))
+        _bump_stat("ai_calls")
+        await _safe_send(channel, f"🔧 **Complete ({language})**\n\n{reply}")
+        await interaction.followup.send("✅ เติมโค้ดให้แล้ว — ดูด้านบน")
+    except AIClientError as e:
+        _bump_stat("ai_errors")
+        await interaction.followup.send(f"❌ ไม่สำเร็จ: {e}")
+
+
+@bot.tree.command(name="test", description="สร้าง unit tests ให้ไฟล์แนบ")
+@app_commands.describe(
+    framework="testing framework (pytest/jest/unittest/googletest)"
+)
+async def test_slash(interaction: discord.Interaction, framework: str = "pytest"):
+    """อ่านไฟล์แนบ และสร้าง unit tests"""
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.DMChannel)):
+        await interaction.response.send_message("❌ ใช้ใน text channel เท่านั้น")
+        return
+
+    history = [m async for m in channel.history(limit=10, oldest_first=False)]
+    history.reverse()
+    file_contents, _ = await read_attachments_from_history(history, "")
+    if not file_contents:
+        await interaction.response.send_message(
+            "❌ ไม่เจอไฟล์แนบ — กรุณาแนบไฟล์ก่อน"
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    prompt = (
+        f"เขียน unit tests ด้วย {framework} สำหรับโค้ดต่อไปนี้:\n\n"
+        + format_files_for_prompt(file_contents)
+        + "\n\nเงื่อนไข:\n"
+        "- ครอบคลุม happy path + edge cases + error cases\n"
+        "- อย่างน้อย 5 test cases\n"
+        "- ใส่ comment อธิบายเป็นไทยว่าแต่ละ test ตรวจอะไร\n"
+        "- ใช้ fixtures/mocks ถ้าจำเป็น\n"
+        "- สามารถรันได้จริง"
+    )
+
+    messages = [
+        {"role": "system", "content": get_persona("coder")["system_prompt"]},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(None, lambda: ai.chat(messages))
+        _bump_stat("ai_calls")
+        await _safe_send(channel, f"🧪 **Unit Tests ({framework})**\n\n{reply}")
+        await interaction.followup.send("✅ สร้าง tests ให้แล้ว — ดูด้านบน")
+    except AIClientError as e:
+        _bump_stat("ai_errors")
+        await interaction.followup.send(f"❌ ไม่สำเร็จ: {e}")
+
+
+@bot.tree.command(name="review", description="review ไฟล์แนบ — ตรวจหาบั๊ก + suggest ปรับปรุง")
+async def review_slash(interaction: discord.Interaction):
+    """อ่านไฟล์แนบล่าสุด และ review"""
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.DMChannel)):
+        await interaction.response.send_message("❌ ใช้ใน text channel เท่านั้น")
+        return
+
+    history = [m async for m in channel.history(limit=10, oldest_first=False)]
+    history.reverse()
+    file_contents, _ = await read_attachments_from_history(history, "")
+    if not file_contents:
+        await interaction.response.send_message(
+            "❌ ไม่เจอไฟล์แนบ — กรุณาแนบไฟล์ก่อน"
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    prompt = (
+        "Review โค้ดต่อไปนี้:\n"
+        "- หาบั๊ก / ช่องโหว่ security\n"
+        "- ตรวจ best practices (DRY, SOLID, KISS)\n"
+        "- ตรวจ performance (Big-O, memory)\n"
+        "- ตรวจ error handling\n"
+        "- ตรวจ naming / readability\n"
+        "- ให้คะแนน /10 พร้อมเหตุผล\n"
+        "- สรุปเป็น bullet points ก่อน แล้วตามด้วยโค้ดที่แก้แล้ว\n\n"
+        "โค้ด:\n"
+        + format_files_for_prompt(file_contents)
+    )
+
+    messages = [
+        {"role": "system", "content": get_persona("coder")["system_prompt"]},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(None, lambda: ai.chat(messages))
+        _bump_stat("ai_calls")
+        await _safe_send(channel, f"🔍 **Code Review**\n\n{reply}")
+        await interaction.followup.send("✅ Review เสร็จแล้ว — ดูด้านบน")
+    except AIClientError as e:
+        _bump_stat("ai_errors")
+        await interaction.followup.send(f"❌ ไม่สำเร็จ: {e}")
+
+
+# ---------- helper สำหรับไฟล์แนบจาก history ----------
+async def read_attachments_from_history(messages, language_filter: str):
+    """อ่านไฟล์แนบจาก history ของข้อความ"""
+    import os
+    from config import ALLOWED_FILE_EXTENSIONS, MAX_FILE_SIZE_KB
+    from logger import setup_logger
+    log = setup_logger("attachments")
+
+    file_contents = []
+
+    for msg in messages:
+        if not msg.attachments:
+            continue
+        for att in msg.attachments:
+            name = att.filename.lower()
+            ext = os.path.splitext(name)[1]
+            if ext not in ALLOWED_FILE_EXTENSIONS:
+                continue
+            size_kb = att.size / 1024
+            if size_kb > MAX_FILE_SIZE_KB:
+                continue
+            try:
+                file_bytes = await att.read()
+                try:
+                    file_text = file_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    file_text = file_bytes.decode("latin-1", errors="replace")
+                if len(file_text) > 10000:
+                    file_text = file_text[:10000] + "\n\n... [ไฟล์ถูกตัด]"
+                file_contents.append({
+                    "filename": att.filename,
+                    "language": ext.lstrip("."),
+                    "content": file_text,
+                    "size_kb": round(size_kb, 1),
+                })
+            except Exception as e:
+                log.error("อ่านไฟล์แนบ %s ไม่ได้: %s", att.filename, e)
+
+    return file_contents, []
+
+
 # ---------- helper text ----------
 def _help_text() -> str:
     return (
@@ -333,11 +588,17 @@ def _help_text() -> str:
         "`/image <prompt>` — สร้างรูปจากคำอธิบาย\n"
         "`/stats` — ดูสถิติการใช้งาน\n"
         "\n"
+        "**🛠️ เครื่องมือเขียนโค้ด:**\n"
+        "`/snippet <lang> <task>` — สร้างโค้ดสั้น ๆ สำหรับ task\n"
+        "`/complete <lang>` — เติมโค้ดที่ขาดในไฟล์แนบ\n"
+        "`/test [framework]` — สร้าง unit tests ให้ไฟล์แนบ\n"
+        "`/review` — review ไฟล์แนบ หาบั๊ก + ปรับปรุง\n"
+        "\n"
         "**วิธีคุยกับบอท**\n"
         "• ในเซิร์ฟเวอร์: @mention บอทแล้วพิมพ์ข้อความ\n"
         "• ใน DM: พิมพ์อะไรก็ได้ บอทจะตอบทันที\n"
         "• ในห้อง auto-respond: พิมพ์อะไรก็ได้ บอทจะตอบอัตโนมัติ\n"
-        "• ส่งไฟล์ .py/.js/.txt แล้ว @mention เพื่อให้บอทวิเคราะห์\n"
+        "• พิมพ์ 'วาดรูป X' — บอทจะสร้างรูปให้อัตโนมัติ\n"
     )
 
 
@@ -356,8 +617,7 @@ def main():
         sys.exit(1)
 
     log.info("🚀 กำลังเริ่มบอท...")
-    log.info("📦 Model: %s | Auto-channels: %d | Owner IDs: %s",
-             ai.model, len(AUTO_RESPOND_CHANNEL_IDS), OWNER_IDS or "(none)")
+    log.info("📦 Model: %s | Auto-channels: %d", ai.model, len(AUTO_RESPOND_CHANNEL_IDS))
 
     try:
         bot.run(DISCORD_TOKEN)
